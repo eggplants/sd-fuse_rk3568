@@ -1,0 +1,112 @@
+name: Build SD images
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_kernel:
+        description: "Build kernel (and 3rd-party drivers) from source before making the image"
+        type: boolean
+        default: true
+      kernel_branch:
+        description: "friendlyarm/kernel-rockchip branch"
+        type: string
+        default: nanopi6-v6.1.y
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    # Native arm64 runner: no cross toolchain needed, tools/aarch64/* binaries are used.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - debian-trixie-core-arm64
+          - ubuntu-noble-core-arm64
+    env:
+      TARGET_OS: ${{ matrix.target }}
+      SDFUSE_NONINTERACTIVE: "1"
+      BUILD_KERNEL: ${{ github.event_name != 'workflow_dispatch' || inputs.build_kernel }}
+      KERNEL_BRANCH: ${{ inputs.kernel_branch || 'nanopi6-v6.1.y' }}
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential make bc bison flex cpio lz4 kmod \
+            device-tree-compiler libncurses-dev libssl-dev libelf-dev \
+            android-sdk-libsparse-utils exfatprogs btrfs-progs e2fsprogs \
+            parted fdisk rsync swig wget git xz-utils python3
+
+      - name: Prepare out directory
+        run: mkdir -p out
+
+      - name: Clone kernel source
+        if: env.BUILD_KERNEL == 'true'
+        run: |
+          git clone https://github.com/friendlyarm/kernel-rockchip \
+            --depth 1 -b "${KERNEL_BRANCH}" out/kernel-rk3568
+          git -C out/kernel-rk3568 log -1 --oneline
+
+      - name: Build kernel and update image files
+        if: env.BUILD_KERNEL == 'true'
+        run: |
+          KERNEL_SRC="$PWD/out/kernel-rk3568" ./build-kernel.sh "${TARGET_OS}"
+
+      - name: Make SD image
+        run: ./mk-sd-image.sh "${TARGET_OS}"
+
+      - name: Compress image
+        id: image
+        run: |
+          IMG=$(ls out/rk3568-sd-*.img | head -n1)
+          # Free space before compressing
+          sudo rm -rf out/kernel-rk3568 out/output_rk3568_kmodules out/rootfs_new "${TARGET_OS}"
+          xz -T0 -v "${IMG}"
+          (cd out && sha256sum "$(basename "${IMG}").xz" > "$(basename "${IMG}").xz.sha256")
+          echo "name=$(basename "${IMG}")" >> "$GITHUB_OUTPUT"
+          ls -lh out/*.img.xz*
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.image.outputs.name }}
+          path: |
+            out/*.img.xz
+            out/*.img.xz.sha256
+          compression-level: 0
+          retention-days: 14
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          files: dist/*
